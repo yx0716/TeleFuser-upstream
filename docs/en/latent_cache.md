@@ -128,14 +128,14 @@ to full denoising, so the main path is never poisoned by a bad cache entry.
 
 ## Factory Function
 
-The production path does not construct `LatentCache` directly. Instead,
-`CacheServiceFactory` builds a `CacheService` from CLI arguments and the
-`CACHE_CONFIG` declared in the pipeline file:
+The production path no longer constructs `LatentCache` directly. Instead,
+the Cacheseek TeleFuser adapter builds a `(CacheService, TeleFuserCacheAdapter)`
+pair from CLI arguments and the `CACHE_CONFIG` declared in the pipeline file:
 
 ```python
-from telefuser.service.cache import CacheServiceFactory
+from cacheseek.adapters.telefuser.cache_factory import CacheServiceFactory
 
-cache_service = CacheServiceFactory.create_cache_service(
+cache_service, cache_adapter = CacheServiceFactory.create_cache_service(
     ppl_file="examples/wan_video/wan22_14b_text_to_video_service.py",
     enable_latent_cache=True,
     cache_mode="read_write",  # "read_write" / "read_only" / "write_only"
@@ -149,18 +149,17 @@ cache_service = CacheServiceFactory.create_cache_service(
 2. Overrides the final config with the CLI's `enable_latent_cache` /
    `cache_mode`.
 3. Initializes the cache log sink up front.
-4. Loads `build_latent_data` from `ppl_file` (**must exist**, otherwise it
-   raises an error).
-5. Instantiates `LatentCache(cache_dir, config)` and wraps it inside
-   `CacheService`.
+4. Builds the Cacheseek storage, vector store, metadata manager, and strategy.
+5. Returns the framework-agnostic `CacheService` plus the TeleFuser adapter
+   used for `build_query`, `apply_resume`, and `on_response`.
 
-Manual construction is also supported when needed:
+Manual construction should use Cacheseek primitives directly when needed:
 
 ```python
 from pathlib import Path
 
-from telefuser.cache_mem.config import CacheConfig
-from telefuser.cache_mem.latent_cache import LatentCache
+from cacheseek.core.config import CacheConfig
+from cacheseek.core.lifecycle import CacheService
 
 config = CacheConfig(
     enable_latent_cache=True,
@@ -168,13 +167,15 @@ config = CacheConfig(
     cache_strategy_type="video_approximate",
     vector_dim=2048,
 )
-cache = LatentCache(Path(config.latent_cache_dir), config)
+cache_service = CacheService.from_config(config)
 ```
 
-The strategy class is looked up in the registry via `cache_strategy_type`:
+The strategy class is selected by Cacheseek's TeleFuser factory from
+`cache_strategy_type`. Custom strategies should be registered in Cacheseek,
+not under `telefuser.cache_mem`.
 
 ```python
-from telefuser.cache_mem.strategies import register_strategy, get_strategy_class
+from cacheseek.core.strategies import get_strategy_class, register_strategy
 
 register_strategy("video_approximate", VideoBasedApproximateCache)  # already registered by default
 strategy_cls = get_strategy_class("video_approximate")
@@ -203,17 +204,17 @@ The only production strategy implementation is
 
 #### Write Path
 
-When a request finishes, the pipeline hands its `latent_payload` (containing
-the per-step latents plus video frames used for prompt similarity) to
-`CacheService.save_latent_payload`, which enqueues it onto the
-`cache-save-worker` background thread. The thread invokes
-`LatentCache.save`:
+When a request finishes, the pipeline returns `latent_payload` containing
+the per-step latents plus video frames used for prompt similarity. The service
+layer passes that payload through `TeleFuserCacheAdapter.on_response`, then
+calls `CacheService.save(cache_query, outputs)`, which enqueues it onto the
+Cacheseek async save worker:
 
 1. Writes each step's latent to the KV store under a key shaped like
    `f"{cache_id}_step{step}"`.
 2. Encodes the video frames with `Qwen3-VL-Embedding` and upserts the
    vector into the vector store (default collection name `video`).
-3. Registers `cache_id → {prompt, saved_steps, size_mb, …}` in metadata,
+3. Registers `cache_id -> {prompt, saved_steps, size_mb, ...}` in metadata,
    persisting `prompt_index.json` and `cache_meta.json`.
 
 If any step fails, all the latents / vectors / metadata that were already
@@ -221,11 +222,12 @@ written are rolled back cleanly to avoid an inconsistent state.
 
 #### Hit Path
 
-When a new request arrives, `CacheService.build_latent_data`:
+When a new request arrives, the service layer runs
+`adapter.build_query -> cache_service.lookup -> adapter.apply_resume`:
 
 1. Waits on `vector_update_idle` to make sure the vector upsert from the
    previous async save has been committed.
-2. Calls `LatentCache.lookup`: encodes the new prompt, queries the top-k
+2. Calls Cacheseek lookup: encodes the new prompt, queries the top-k
    approximate caches in the vector store, optionally reranks with
    Qwen3-VL-Reranker, and compares against the threshold to decide on a
    hit.
@@ -287,12 +289,9 @@ CACHE_CONFIG = dict(
 )
 ```
 
-The pipeline file also has to provide two hooks the service layer relies on
-to wire the cache into the main path:
+The pipeline file only needs to expose `run_with_file` plus a `CACHE_CONFIG`
+dict for Cacheseek configuration:
 
-- `build_latent_data(task_data: dict, cache_result=None) -> dict`: converts
-  `cache_result` into the `latent_data` dict the pipeline expects (with
-  `hit / skip_step / cached_latent / saved_steps`).
 - `run_with_file(pipeline, **task_data) -> dict`: feeds `latent_data` into
   the pipeline and returns `latent_payload` as part of the result so the
   service layer can write it back to the cache.

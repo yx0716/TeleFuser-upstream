@@ -45,6 +45,9 @@ class LingBotWorldFastPipelineConfig:
     orig_height: int = 480
     orig_width: int = 832
     max_area: int = 480 * 832
+    # 滚动 KV 窗口（单位：latent 帧；local_attn_size 含 sink）。-1 = 全长 KV（旧行为）
+    local_attn_size: int = 7
+    sink_size: int = 3
 
 
 class LingBotWorldFastPipeline(BasePipeline):
@@ -103,7 +106,13 @@ class LingBotWorldFastPipeline(BasePipeline):
             str(fast_path),
             torch_dtype=config.dit_torch_dtype,
             control_type=config.control_type,
-            config={"patch_size": (1, 2, 2), "text_len": 512, "control_type": config.control_type},
+            config={
+                "patch_size": (1, 2, 2),
+                "text_len": 512,
+                "control_type": config.control_type,
+                "local_attn_size": config.local_attn_size,
+                "sink_size": config.sink_size,
+            },
         ).to(self.device)
         self.dit.eval().requires_grad_(False)
 
@@ -415,7 +424,9 @@ class LingBotWorldFastPipeline(BasePipeline):
         frame_num = (lat_f - 1) * 4 + 1
         patch_area = self.dit.patch_size[1] * self.dit.patch_size[2]
         frame_tokens = (lat_h * lat_w) // patch_area
-        kv_size = frame_tokens * lat_f
+        # 滚动窗口：KV buffer 只开 local_attn_size 帧（含 sink）；-1 = 全长（旧行为）
+        kv_window_frames = lat_f if self.config.local_attn_size == -1 else min(self.config.local_attn_size, lat_f)
+        kv_size = frame_tokens * kv_window_frames
         max_seq_len = session_config.chunk_size * frame_tokens
         max_attention_size = (
             kv_size if session_config.max_attention_size is None else int(session_config.max_attention_size)
@@ -480,8 +491,21 @@ class LingBotWorldFastPipeline(BasePipeline):
             max_attention_size=max_attention_size,
             scheduler=FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1, use_dynamic_shifting=False),
             generator=generator,
+            kv_local_attn_size=self.config.local_attn_size,
+            kv_sink_size=self.config.sink_size if self.config.local_attn_size != -1 else 0,
         )
         runtime.timesteps = self.timesteps.select(runtime.scheduler, session_config.sample_shift)
+        if session_config.world_kv_binding is not None:
+            runtime.world_kv_binding = session_config.world_kv_binding
+            try:
+                runtime.world_kv_binding.on_runtime_created(runtime, session_config)
+                if runtime.world_kv_cached_latents:
+                    logger.info(
+                        f"world_kv: fast-forward {len(runtime.world_kv_cached_latents)} chunks (decode-only)"
+                    )
+            except Exception as exc:
+                logger.warning(f"world_kv on_runtime_created failed; falling back to cold run: {exc}")
+                runtime.world_kv_cached_latents = {}
         self._notify_progress(progress_callback, "runtime_created", width=width, height=height, latent_frames=lat_f)
         logger.info(f"LingBot runtime created: {width}x{height}, latent={lat_f}x{lat_h}x{lat_w}")
         return runtime
@@ -504,34 +528,47 @@ class LingBotWorldFastPipeline(BasePipeline):
         if control_chunk is None and runtime.control_chunks is not None and idx < len(runtime.control_chunks):
             control_chunk = runtime.control_chunks[idx]
 
-        self._notify_progress(progress_callback, "denoising_chunk", index=idx)
         current_start = idx * runtime.chunk_size * runtime.frame_tokens
-        denoised = self.denoise_stage.denoise_chunk(
-            latent_chunk=latent_chunk,
-            condition_chunk=condition_chunk,
-            prompt_emb=runtime.prompt_emb,
-            timesteps=runtime.timesteps,
-            scheduler=runtime.scheduler,
-            control_chunk=control_chunk,
-            self_kv_cache=runtime.self_kv_cache,
-            crossattn_cache=runtime.crossattn_cache,
-            current_start=current_start,
-            max_attention_size=runtime.max_attention_size,
-            generator=runtime.generator,
-        )
+        cached_latent = runtime.world_kv_cached_latents.pop(idx, None) if runtime.world_kv_cached_latents else None
+        if cached_latent is not None:
+            # world_kv fast-forward 命中：KV 已被 seed，latent 来自缓存骨架 → decode-only，
+            # 跳过 denoise 与 clean-KV rewrite（generator 抽取已由 binding 对齐烧掉）。
+            self._notify_progress(progress_callback, "decoding_cached_chunk", index=idx)
+            denoised = cached_latent.to(device=self.device, dtype=self.torch_dtype)
+        else:
+            self._notify_progress(progress_callback, "denoising_chunk", index=idx)
+            denoised = self.denoise_stage.denoise_chunk(
+                latent_chunk=latent_chunk,
+                condition_chunk=condition_chunk,
+                prompt_emb=runtime.prompt_emb,
+                timesteps=runtime.timesteps,
+                scheduler=runtime.scheduler,
+                control_chunk=control_chunk,
+                self_kv_cache=runtime.self_kv_cache,
+                crossattn_cache=runtime.crossattn_cache,
+                current_start=current_start,
+                max_attention_size=runtime.max_attention_size,
+                generator=runtime.generator,
+            )
 
-        self._notify_progress(progress_callback, "updating_cache", index=idx)
-        self.dit(
-            x=denoised.to(dtype=self.torch_dtype),
-            timestep=torch.zeros((1,), dtype=torch.float32, device=self.device),
-            context=runtime.prompt_emb,
-            y=condition_chunk,
-            control_tensor=control_chunk,
-            kv_cache=runtime.self_kv_cache,
-            crossattn_cache=runtime.crossattn_cache,
-            current_start=current_start,
-            max_attention_size=runtime.max_attention_size,
-        )
+            self._notify_progress(progress_callback, "updating_cache", index=idx)
+            self.dit(
+                x=denoised.to(dtype=self.torch_dtype),
+                timestep=torch.zeros((1,), dtype=torch.float32, device=self.device),
+                context=runtime.prompt_emb,
+                y=condition_chunk,
+                control_tensor=control_chunk,
+                kv_cache=runtime.self_kv_cache,
+                crossattn_cache=runtime.crossattn_cache,
+                current_start=current_start,
+                max_attention_size=runtime.max_attention_size,
+            )
+
+            if runtime.world_kv_binding is not None:
+                try:
+                    runtime.world_kv_binding.on_chunk_finalized(runtime, idx, denoised)
+                except Exception as exc:
+                    logger.warning(f"world_kv on_chunk_finalized failed at chunk {idx}: {exc}")
 
         self._notify_progress(progress_callback, "decoding_chunk", index=idx, device=str(self.vae_device))
         frames = self.decode_video_cached(

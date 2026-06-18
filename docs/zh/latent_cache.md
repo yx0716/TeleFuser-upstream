@@ -121,13 +121,13 @@ shape / 范围校验，shape 不一致或 `skip_step` 越界时会自动丢弃�
 
 ## 工厂函数
 
-线上路径不直接构造 `LatentCache`，而是由 `CacheServiceFactory` 根据
-CLI 参数和 pipeline 文件中的 `CACHE_CONFIG` 生成 `CacheService`：
+线上路径不再直接构造 `LatentCache`，而是由 Cacheseek 的 TeleFuser 适配器根据
+CLI 参数和 pipeline 文件中的 `CACHE_CONFIG` 生成 `(CacheService, TeleFuserCacheAdapter)`：
 
 ```python
-from telefuser.service.cache import CacheServiceFactory
+from cacheseek.adapters.telefuser.cache_factory import CacheServiceFactory
 
-cache_service = CacheServiceFactory.create_cache_service(
+cache_service, cache_adapter = CacheServiceFactory.create_cache_service(
     ppl_file="examples/wan_video/wan22_14b_text_to_video_service.py",
     enable_latent_cache=True,
     cache_mode="read_write",  # "read_write" / "read_only" / "write_only"
@@ -139,16 +139,17 @@ cache_service = CacheServiceFactory.create_cache_service(
 1. 从 `ppl_file` 加载 `CACHE_CONFIG`（dict 或 `CacheConfig` 实例）作为默认配置基础。
 2. 用 CLI 的 `enable_latent_cache` / `cache_mode` 覆盖最终配置。
 3. 提前初始化 cache 日志 sink。
-4. 加载 `ppl_file` 中的 `build_latent_data` 函数（**必须存在**，否则报错）。
-5. 实例化 `LatentCache(cache_dir, config)`，再包装为 `CacheService`。
+4. 构造 Cacheseek 的存储、向量库、元数据管理器和策略。
+5. 返回框架无关的 `CacheService`，以及用于 `build_query`、`apply_resume`
+   和 `on_response` 的 TeleFuser 适配器。
 
-需要直接构造时也支持手动接入：
+需要直接构造时应使用 Cacheseek 原语：
 
 ```python
 from pathlib import Path
 
-from telefuser.cache_mem.config import CacheConfig
-from telefuser.cache_mem.latent_cache import LatentCache
+from cacheseek.core.config import CacheConfig
+from cacheseek.core.lifecycle import CacheService
 
 config = CacheConfig(
     enable_latent_cache=True,
@@ -156,13 +157,14 @@ config = CacheConfig(
     cache_strategy_type="video_approximate",
     vector_dim=2048,
 )
-cache = LatentCache(Path(config.latent_cache_dir), config)
+cache_service = CacheService.from_config(config)
 ```
 
-策略类通过 `cache_strategy_type` 在注册表中查找：
+策略类由 Cacheseek 的 TeleFuser factory 根据 `cache_strategy_type` 选择。
+自定义策略应注册到 Cacheseek，而不是 `telefuser.cache_mem`：
 
 ```python
-from telefuser.cache_mem.strategies import register_strategy, get_strategy_class
+from cacheseek.core.strategies import get_strategy_class, register_strategy
 
 register_strategy("video_approximate", VideoBasedApproximateCache)  # 默认已注册
 strategy_cls = get_strategy_class("video_approximate")
@@ -185,24 +187,26 @@ strategy_cls = get_strategy_class("video_approximate")
 
 #### 写入路径
 
-请求结束、pipeline 把 `latent_payload`（含按步存储的 latent + 用于 prompt
-相似度的视频帧）传给 `CacheService.save_latent_payload`，后者放入
-`cache-save-worker` 后台线程；线程调用 `LatentCache.save`：
+请求结束后，pipeline 返回 `latent_payload`（含按步存储的 latent + 用于 prompt
+相似度的视频帧）。服务层先经过 `TeleFuserCacheAdapter.on_response` 打包，
+再调用 `CacheService.save(cache_query, outputs)`，由 Cacheseek 异步保存 worker
+处理：
 
 1. 将每个 step 的 latent 写到 KV，key 形如 `f"{cache_id}_step{step}"`。
 2. 通过 `Qwen3-VL-Embedding` 将视频帧编码成向量，upsert 至 向量检索库（默认
    collection 名 `video`）。
-3. 在 metadata 里登记 `cache_id → {prompt, saved_steps, size_mb, …}`，
+3. 在 metadata 里登记 `cache_id -> {prompt, saved_steps, size_mb, ...}`，
    持久化 `prompt_index.json` 和 `cache_meta.json`。
 
 任何一步失败，已写入的 latent / 向量 / metadata 都会回滚干净，避免状态不一致。
 
 #### 命中路径
 
-新请求到达，`CacheService.build_latent_data`：
+新请求到达后，服务层执行
+`adapter.build_query -> cache_service.lookup -> adapter.apply_resume`：
 
 1. 等待 `vector_update_idle`——确保上一笔异步 save 的向量 upsert 已落库。
-2. 调用 `LatentCache.lookup`：对新 prompt 编码，在向量检索库中查 top-k 近似
+2. 调用 Cacheseek lookup：对新 prompt 编码，在向量检索库中查 top-k 近似
    缓存；可选用 Qwen3-VL-Reranker 重排，跟阈值比对决定是否命中。
 3. 命中后从 KV 读出 `skip_step` 对应的 latent 张量，封装成 `CacheResult` 返回。
 

@@ -40,6 +40,7 @@ class ServiceContainer:
     stream_pipeline_service: StreamPipelineService | None = None
     media_service: MediaGenerationService | None = None
     cache_service: Any | None = None
+    cache_adapter: Any | None = None  # cacheseek.adapters.telefuser.TeleFuserCacheAdapter
     _cache_dir: Path | None = field(default=None, repr=False)
 
     @classmethod
@@ -112,28 +113,36 @@ class ServiceContainer:
             file_service=self.file_service,
             inference_service=self.pipeline_service,
             cache_service=self.cache_service,
+            cache_adapter=self.cache_adapter,
         )
         return self.media_service
 
     def initialize_cache_service(self, pipe_path: str) -> Any | None:
-        """Initialize optional latent cache service when enabled."""
+        """Initialize optional latent cache service when enabled.
+
+        """
         if not getattr(self.config, "enable_latent_cache", False):
             return None
 
-        # Lazy import to avoid pulling cache_mem deps when disabled.
-        from ..cache.cache_factory import CacheServiceFactory
+        # Lazy import to avoid pulling cacheseek deps when disabled.
+        from cacheseek.adapters.telefuser.cache_factory import CacheServiceFactory
 
         try:
-            self.cache_service = CacheServiceFactory.create_cache_service(
+            result = CacheServiceFactory.create_cache_service(
                 ppl_file=pipe_path,
                 enable_latent_cache=True,
             )
         except Exception as exc:
             logger.warning(f"CacheServiceFactory.create_cache_service failed: {exc}")
-            self.cache_service = None
+            result = None
 
-        if self.cache_service is None:
-            logger.warning("enable_latent_cache=True but cache_service is None")
+        if result is None:
+            self.cache_service = None
+            self.cache_adapter = None
+            logger.warning("enable_latent_cache=True but cache service init returned None")
+            return None
+
+        self.cache_service, self.cache_adapter = result
         return self.cache_service
 
     def initialize_all(
@@ -216,6 +225,7 @@ class ServiceContainer:
                 self.file_service.cache_dir,
                 self.pipeline_service,
                 cache_service=self.cache_service,
+                cache_adapter=self.cache_adapter,  # forward adapter to api_server
             )
 
         if self.stream_pipeline_service:
@@ -256,7 +266,7 @@ class ServiceContainer:
             except Exception as exc:
                 logger.warning(f"cache service shutdown failed: {exc}")
             self.cache_service = None
-
+        self.cache_adapter = None
         self.media_service = None
 
 

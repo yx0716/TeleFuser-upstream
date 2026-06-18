@@ -28,6 +28,8 @@ class LingBotWorldFastSessionConfig:
     poses: object | None = None
     intrinsics: object | None = None
     action: object | None = None
+    # cacheseek world_kv 跨请求 KV 复用（可选；None = 行为与原版完全一致）
+    world_kv_binding: object | None = None
     control_move_step: float = 0.18
     control_yaw_step_degrees: float = 10.0
     control_lateral_step: float = 0.12
@@ -58,6 +60,12 @@ class LingBotWorldFastRuntimeState:
     emitted_frames: int = 0
     active: bool = True
     generator: torch.Generator | None = None
+    # KV 几何（latent 帧）：binding 据此组装滚动窗口 ring。-1 = 全长 KV
+    kv_local_attn_size: int = -1
+    kv_sink_size: int = 0
+    # cacheseek world_kv：binding + fast-forward 命中的 decode-only latent（chunk_idx → x0）
+    world_kv_binding: object | None = None
+    world_kv_cached_latents: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass

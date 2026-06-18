@@ -44,14 +44,18 @@ dependencies = [
     "ray",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
-    "torchvision",
+    # Pin the torch stack to the validated combo (2.7.0 + cu126). Without this a
+    # fresh `pip install -e .` resolves to the latest torch (2.12 / cuda 13) via
+    # torchvision, which the H100 deployment + cacheseek repro were NOT validated on.
+    "torch==2.7.0",
+    "torchvision==0.22.0",
 ]
 
 [project.optional-dependencies]
 
-# Latent cache subsystem (telefuser.cache_mem).
+# Latent cache subsystem used by Cacheseek-backed service integrations.
 # Required only when the service is started with enable_latent_cache=true
-# (or when running the wan22 service example with cache_mem). Installing
+# (or when running the Wan2.2 service example with latent cache). Installing
 # without this extra leaves the cache layer disabled and adds zero overhead.
 cache = [
     "faiss-cpu",
