@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 
 import torch
-from cacheseek.core.config import CacheConfig
+from cacheseek import CacheConfig
 
 from telefuser.core.config import AttentionConfig, AttnImplType, FeatureCacheConfig, WeightOffloadType
 from telefuser.core.module_manager import ModuleManager
