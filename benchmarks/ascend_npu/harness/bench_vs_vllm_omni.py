@@ -533,7 +533,8 @@ def _run_vllm_omni_minimax_h3(args: argparse.Namespace, out_dir: Path) -> dict[s
                 digest = hashlib.sha256(rgb.tobytes()).hexdigest()
                 stage_durs = getattr(output, "stage_durations", None) or {}
                 denoise_val = float(
-                    stage_durs.get("diffuse")
+                    stage_durs.get("MiniMaxH3Pipeline.diffuse")
+                    or stage_durs.get("diffuse")
                     or stage_durs.get("denoise")
                     or stage_durs.get("denoising")
                     or stage_durs.get("dit")
