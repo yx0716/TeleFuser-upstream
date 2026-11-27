@@ -457,3 +457,68 @@ def test_minimax_h3_adaln_cache_indices_for_skips_assert_async_on_npu(monkeypatc
     assert idx.tolist() == [0, 2]
     assert assert_calls == 0
 
+
+def test_minimax_h3_video_vae_decode_moves_frames_to_cpu_and_clears_cache_on_npu(monkeypatch) -> None:
+    import telefuser.pipelines.minimax_h3.vae as vae_mod
+    from telefuser.core.config import ModelRuntimeConfig
+    from telefuser.core.module_manager import ModuleManager
+
+    class _FakeNpuParam(torch.Tensor):
+        @property
+        def device(self):  # type: ignore[override]
+            return SimpleNamespace(type="npu")
+
+    class _FakeVideoVAE(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prepared_dtype = None
+
+        def parameters(self, recurse: bool = True):
+            yield torch.zeros(()).as_subclass(_FakeNpuParam)
+
+        def prepare_decoder_autocast_weights(self, dtype: torch.dtype) -> None:
+            self.prepared_dtype = dtype
+
+        def decode_normalized(self, latent: torch.Tensor) -> torch.Tensor:
+            return latent[:, :3]
+
+    class _DummyAutocast:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    empty_calls = 0
+
+    def fake_empty_cache() -> None:
+        nonlocal empty_calls
+        empty_calls += 1
+
+    monkeypatch.setattr(torch, "autocast", lambda **_kw: _DummyAutocast())
+    monkeypatch.setattr(vae_mod.current_platform, "empty_cache", fake_empty_cache)
+
+    video_vae = _FakeVideoVAE()
+    manager = ModuleManager(device="cpu")
+    manager.add_module(video_vae, "minimax_h3_video_vae")
+    runtime = ModelRuntimeConfig(device_type="cpu", torch_dtype=torch.float32)
+    stage = vae_mod.MiniMaxH3VideoVAEStage(manager, runtime)
+    stage.onload_models_flag = True
+
+    class _LatentIgnoreNpuTo(torch.Tensor):
+        def to(self, *args, **kwargs):  # type: ignore[override]
+            if args and getattr(args[0], "type", None) == "npu":
+                return self
+            return super().to(*args, **kwargs)
+
+    out = stage.decode_video(torch.zeros(1, 24, 1, 2, 2).as_subclass(_LatentIgnoreNpuTo))
+    assert out.shape == (1, 1, 2, 2, 3)
+    assert out.device.type == "cpu"
+    assert out.dtype == torch.float32
+    assert video_vae.prepared_dtype == torch.float16
+    assert empty_calls == 1
+
+

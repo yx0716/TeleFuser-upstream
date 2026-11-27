@@ -183,7 +183,9 @@ def _worker_loop(
                     args = [args]
                 y = getattr(stage, name)(*args, **kwargs)
             del kwargs, args
-            if getattr(stage, "empty_cache_after_call", True):
+            if world_size > 1 and rank != 0:
+                y = None
+            if not host_queue and getattr(stage, "empty_cache_after_call", True):
                 platform.empty_cache()
             if transport_output and tensor_output_channel is not None and (world_size == 1 or rank == 0):
                 y = tensor_output_channel.send(y)
@@ -192,6 +194,9 @@ def _worker_loop(
                 if host_queue:
                     y = to_device(y, "cpu", preserve_tuples=True)
                 queue_out.put(y)
+                y = None
+            if host_queue and getattr(stage, "empty_cache_after_call", True):
+                platform.empty_cache()
     except Exception as e:
         import traceback
 

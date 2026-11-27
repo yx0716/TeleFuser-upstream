@@ -319,10 +319,16 @@ class MiniMaxH3VideoVAEStage(BaseStage):
             self.video_vae.prepare_decoder_autocast_weights(torch.float16)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_fp16_autocast):
             frames = self.video_vae.decode_normalized(latent.to(device))
-        # Keep the large decoded tensor on the producing device. ParallelWorker
-        # can then return a CUDA IPC handle instead of copying FP32 frames into
-        # shared CPU storage inside the worker process.
-        return frames.permute(0, 2, 3, 4, 1).float().contiguous()
+        # Keep the large decoded tensor on the producing device for CUDA IPC;
+        # on NPU (host-queue transport), move to CPU immediately so decoder
+        # output buffers and cached workspace segments are released before the
+        # next request onloads the text encoder.
+        result = frames.permute(0, 2, 3, 4, 1).float().contiguous()
+        if device.type == "npu":
+            result = result.cpu()
+            del frames
+            current_platform.empty_cache()
+        return result
 
 
 class MiniMaxH3AudioVAEStage(BaseStage):
