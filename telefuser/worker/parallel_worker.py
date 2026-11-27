@@ -100,6 +100,7 @@ def _worker_loop(
             os.environ["MASTER_PORT"] = str(master_port)
             if hccl_if_base_port is not None:
                 os.environ["HCCL_IF_BASE_PORT"] = str(hccl_if_base_port)
+                os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
 
         if host_queue or world_size > 1:
             ids = parallel_config.device_ids

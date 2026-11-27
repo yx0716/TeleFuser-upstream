@@ -45,6 +45,8 @@ from telefuser.ops.rotary import apply_rotary_emb_neox
 from telefuser.utils.logging import logger
 
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
+# Exact power-of-two Q/K/V pre-scale protecting Ascend LaserAttention's FP16 QK^T workspace from H3 outlier overflow.
+MINIMAX_H3_LASER_INPUT_SCALE = 256.0
 MINIMAX_H3_FP32_PARAM_NAMES = frozenset(
     {
         "video_patch_proj.weight",
@@ -524,6 +526,13 @@ class MiniMaxH3Attention(nn.Module):
             return sequence_lengths[0]
         raise ValueError("MiniMax H3 optimized attention requires one live sequence with optional trailing padding")
 
+    @classmethod
+    def _live_tokens_or_none(cls, sequence_lengths: list[int], total_tokens: int) -> int | None:
+        try:
+            return cls._live_tokens(sequence_lengths, total_tokens)
+        except ValueError:
+            return None
+
     @staticmethod
     def _is_sol_active(sparse_state: SparseAttentionState | None) -> bool:
         return sparse_state is not None and not sparse_state.should_use_dense()
@@ -674,7 +683,37 @@ class MiniMaxH3Attention(nn.Module):
                 key = key_wait()
                 value = value_wait()
             optimized_impls = {AttnImplType.SAGE_ATTN_2_8_8_SM90, AttnImplType.SOL_ATTN}
-            if attention_config is not None and attention_config.attn_impl in optimized_impls:
+            npu_dense_impls = {AttnImplType.MINDIE_ATTN, AttnImplType.TORCH_SDPA, AttnImplType.FLASH_ATTN_4}
+            npu_live_tokens = (
+                self._live_tokens_or_none(sequence_lengths, query.shape[1])
+                if query.device.type == "npu"
+                and (attention_config is None or attention_config.attn_impl in npu_dense_impls)
+                else None
+            )
+            if npu_live_tokens is not None:
+                total_tokens = query.shape[1]
+                live_query = query[:, :npu_live_tokens]
+                live_key = key[:, :npu_live_tokens]
+                live_value = value[:, :npu_live_tokens]
+                selected_impl = (
+                    AttnImplType.MINDIE_ATTN
+                    if attention_config is not None and attention_config.attn_impl == AttnImplType.MINDIE_ATTN
+                    else AttnImplType.TORCH_SDPA
+                )
+                live_output = attention(
+                    live_query,
+                    live_key,
+                    live_value,
+                    attention_config=AttentionConfig.dense_attention(selected_impl),
+                    scale=self.head_dim**-0.5,
+                    laser_input_scale=MINIMAX_H3_LASER_INPUT_SCALE,
+                )
+                if npu_live_tokens == total_tokens:
+                    output = live_output
+                else:
+                    output = torch.zeros_like(query)
+                    output[:, :npu_live_tokens].copy_(live_output)
+            elif attention_config is not None and attention_config.attn_impl in optimized_impls:
                 total_tokens = query.shape[1]
                 live_tokens = self._live_tokens(sequence_lengths, total_tokens)
                 live_query = query[:, :live_tokens].contiguous()
@@ -1093,7 +1132,10 @@ class MiniMaxH3DiT(BaseModel):
         if not self._online_adaln_batches:
             raise RuntimeError("Cannot finalize an online AdaLN cache before any request timestep was observed.")
         if self._online_adaln_copy_device is not None:
-            torch.cuda.synchronize(self._online_adaln_copy_device)
+            if self._online_adaln_copy_device.type == "cuda":
+                torch.cuda.synchronize(self._online_adaln_copy_device)
+            elif self._online_adaln_copy_device.type == "npu":
+                torch.npu.synchronize(self._online_adaln_copy_device)
         for timesteps, block_outputs, final_output in self._online_adaln_batches:
             for row, timestep in enumerate(timesteps.tolist()):
                 key = float(timestep).hex()
@@ -1114,6 +1156,107 @@ class MiniMaxH3DiT(BaseModel):
             final_output=torch.stack([row[2] for row in rows]),
             config=self.config,
             model_fingerprint=self.adaln_fingerprint(),
+            partition=self._online_adaln_partition,
+        )
+        self._activate_inference_only_adaln(cache)
+        self._online_adaln_cache_enabled = False
+        self._online_adaln_partition = None
+        self._online_adaln_rows.clear()
+        self._online_adaln_batches.clear()
+        self._online_adaln_copy_device = None
+        return True
+
+    @staticmethod
+    def _is_adaln_state_name(name: str) -> bool:
+        return name.startswith("time_embedder.") or ".adaln_proj." in name
+
+    def _should_stage_online_adaln_on_cpu(self, device: torch.device) -> bool:
+        return self._online_adaln_cache_enabled and self._adaln_cache is None and device.type == "npu"
+
+    def onload_device(self, device: torch.device, non_blocking: bool | None = None) -> None:
+        if not self._should_stage_online_adaln_on_cpu(device):
+            super().onload_device(device, non_blocking=non_blocking)
+            return
+
+        use_pin_memory = non_blocking if non_blocking is not None else self._use_pinned_memory
+        use_non_blocking = use_pin_memory and device.type in ("cuda", "npu")
+        from telefuser.offload import move_tensors_to_device
+
+        if use_non_blocking and not self.training:
+            for name, param in self.named_parameters():
+                if self._is_adaln_state_name(name):
+                    continue
+                if param.device.type == "cpu":
+                    cached = self._cpu_pinned_param_cache.get(name)
+                    if cached is None or cached.shape != param.shape or cached.dtype != param.dtype:
+                        cached = param.data if param.data.is_pinned() else param.data.pin_memory()
+                        self._cpu_pinned_param_cache[name] = cached
+                    param.data = cached.to(device, non_blocking=True)
+        else:
+            core_params = [p for name, p in self.named_parameters() if not self._is_adaln_state_name(name)]
+            move_tensors_to_device(core_params, device, use_non_blocking)
+
+        core_buffers = [b for name, b in self.named_buffers() if not self._is_adaln_state_name(name)]
+        move_tensors_to_device(core_buffers, device, use_non_blocking)
+        if use_non_blocking:
+            from telefuser.platforms import current_platform
+
+            current_platform.synchronize(device)
+
+    @torch.inference_mode()
+    def materialize_online_adaln_cache_for_timesteps(
+        self,
+        timesteps: Iterable[float] | torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> bool:
+        """Stream AdaLN projections block-by-block onto device and immediately release their 26 GB weights."""
+        if not self._online_adaln_cache_enabled or self._adaln_cache is not None:
+            return self._adaln_cache is not None
+        if self.time_embedder is None:
+            raise RuntimeError("MiniMax H3 AdaLN weights were already released.")
+        unique_ts = torch.unique(torch.as_tensor(timesteps, dtype=torch.float32, device="cpu"), sorted=True)
+        if unique_ts.numel() == 0:
+            raise ValueError("At least one timestep is required to materialize the online AdaLN cache.")
+        fingerprint = self.adaln_fingerprint()
+        embedder_orig_device = next(self.time_embedder.parameters()).device
+        self.time_embedder.to(device)
+        adaln_input = F.silu(self.time_embedder(unique_ts.to(device))).to(torch.bfloat16)
+        if embedder_orig_device.type == "cpu":
+            self.time_embedder.to("cpu")
+
+        def project_cpu_staged(proj: MiniMaxH3AdaLNProjection) -> torch.Tensor:
+            linear = proj.linear
+            if linear is None:
+                raise RuntimeError("MiniMax H3 AdaLN projection weights were released before materialization.")
+            weight_dev = linear.weight if linear.weight.device == device else linear.weight.to(device=device)
+            bias_dev = (
+                None
+                if linear.bias is None
+                else (linear.bias if linear.bias.device == device else linear.bias.to(device=device))
+            )
+            local_out = F.linear(adaln_input, weight_dev, bias_dev)
+            del weight_dev, bias_dev
+            if self.tp_flag and proj.tp_group is not None:
+                local_out = all_gather_cat(
+                    local_out,
+                    dim=-1,
+                    group=proj.tp_group,
+                    world_size=proj.tp_world_size,
+                )
+            out_cpu = local_out.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+            del local_out
+            return out_cpu
+
+        block_outputs = tuple(project_cpu_staged(block.adaln_proj) for block in self.blocks)
+        final_output = project_cpu_staged(self.final_layer.adaln_proj)
+
+        cache = MiniMaxH3AdaLNCache(
+            timesteps=unique_ts,
+            block_outputs=block_outputs,
+            final_output=final_output,
+            config=self.config,
+            model_fingerprint=fingerprint,
             partition=self._online_adaln_partition,
         )
         self._activate_inference_only_adaln(cache)

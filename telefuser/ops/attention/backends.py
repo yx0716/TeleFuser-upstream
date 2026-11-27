@@ -193,11 +193,22 @@ def mindie_attn(
     attn_mask: Tensor | None = None,
     scale: float | None = None,
     is_causal: bool = False,
+    input_scale: float | None = None,
 ) -> Tensor:
     """MindIE-SD attention wrapper for BNSD inputs on Ascend NPU."""
     if is_causal:
         raise ValueError("MINDIE_ATTN does not support causal attention")
-    return mindiesd_attention_forward(q, k, v, attn_mask=attn_mask, scale=scale, head_first=True)
+    resolved_scale = scale
+    use_input_scale = input_scale is not None and input_scale > 1.0
+    if use_input_scale:
+        factor = float(input_scale)
+        base_scale = float(q.shape[-1] ** -0.5) if scale is None else float(scale)
+        q = q / factor
+        k = k / factor
+        v = v / factor
+        resolved_scale = base_scale * (factor * factor)
+    output = mindiesd_attention_forward(q, k, v, attn_mask=attn_mask, scale=resolved_scale, head_first=True)
+    return output * float(input_scale) if use_input_scale else output
 
 
 _try_import_flash_attn()

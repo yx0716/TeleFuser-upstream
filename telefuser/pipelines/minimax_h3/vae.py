@@ -66,6 +66,17 @@ class MiniMaxH3PreparedCondition:
 
 @contextlib.contextmanager
 def _scoped_seed(seed: int, device: torch.device):
+    if device.type == "npu":
+        cpu_state = torch.get_rng_state()
+        npu_state = torch.npu.get_rng_state(device)
+        try:
+            torch.manual_seed(seed)
+            torch.npu.manual_seed(seed)
+            yield
+        finally:
+            torch.set_rng_state(cpu_state)
+            torch.npu.set_rng_state(npu_state, device)
+        return
     devices = [device] if device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
@@ -303,7 +314,7 @@ class MiniMaxH3VideoVAEStage(BaseStage):
     @torch.inference_mode()
     def decode_video(self, latent: torch.Tensor) -> torch.Tensor:
         device = next(self.video_vae.parameters()).device
-        use_fp16_autocast = device.type == "cuda"
+        use_fp16_autocast = device.type in {"cuda", "npu"}
         if use_fp16_autocast:
             self.video_vae.prepare_decoder_autocast_weights(torch.float16)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_fp16_autocast):
