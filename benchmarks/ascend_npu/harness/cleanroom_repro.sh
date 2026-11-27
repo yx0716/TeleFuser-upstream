@@ -57,19 +57,19 @@ REPRO_SH="$RUN_DIR/REPRODUCE.sh"
 if [[ "$MODEL_KIND" == "minimax_h3" ]]; then
   MODEL_CLI_BLOCK="    --model-root /models/checkpoint \\
     --mode t2va \\
-    --gpu-num \"\\\$CARD_COUNT\" \\
+    --gpu-num \"\$CARD_COUNT\" \\
     --duration 5 --aspect-ratio 16:9 \\
     --seed 1101 \\
     --prompt 'In a snowy blue-purple forest, Ori carefully walks past a sleeping giant; footsteps crunch in the snow while the creature breathes and softly snorts.' \\
     --output-path /out/minimax_h3_cleanroom.mp4"
   AUDIO_PROBE_BLOCK="docker run --rm --entrypoint ffprobe \\
-  --mount \"type=bind,src=\\\$OUT_DIR,dst=/out,readonly\" \\
-  \"\\\$TF_IMAGE\" -v error -select_streams a:0 \\
+  --mount \"type=bind,src=\$OUT_DIR,dst=/out,readonly\" \\
+  \"\$TF_IMAGE\" -v error -select_streams a:0 \\
   -show_entries stream=codec_name,sample_rate,channels \\
-  -of default=noprint_wrappers=1 \"/out/\\\$(basename \"\\\$MP4_FILE\")\""
+  -of default=noprint_wrappers=1 \"/out/\$(basename \"\$MP4_FILE\")\""
 else
   MODEL_CLI_BLOCK="    --model_root /models/checkpoint \\
-    --gpu_num \"\\\$CARD_COUNT\" \\
+    --gpu_num \"\$CARD_COUNT\" \\
     --resolution 480p --aspect_ratio 16:9 --num_frames 121 \\
     --prompt 'A red kite flying over a green field'"
   AUDIO_PROBE_BLOCK=":"
@@ -93,7 +93,7 @@ done
 CARD_COUNT="\${#DEV_IDS[@]}"
 
 mkdir -p "\$OUT_DIR"
-docker run --rm --shm-size=64g \\
+docker run --rm --shm-size=128g \\
   "\${DEV_ARGS[@]}" \\
   --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc \\
   --mount type=bind,src=/usr/local/dcmi,dst=/usr/local/dcmi,readonly \\
@@ -104,6 +104,7 @@ docker run --rm --shm-size=64g \\
   --mount "type=bind,src=\$TF_MODEL_DIR,dst=/models/checkpoint,readonly" \\
   --mount "type=bind,src=\$OUT_DIR,dst=/out" \\
   -e TELEAI_EXAMPLE_OUTPUT_DIR=/out -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
+  -e PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \\
   "\$TF_IMAGE" python "$ENTRYPOINT_SCRIPT" \\
 $MODEL_CLI_BLOCK
 
