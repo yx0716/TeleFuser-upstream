@@ -290,8 +290,11 @@ class MiniMaxH3AdaLNCache:
         requested = timesteps.detach().to(device=device, dtype=torch.float32)
         indices = torch.searchsorted(cached_timesteps, requested)
         safe_indices = indices.clamp_max(cached_timesteps.numel() - 1)
-        matches = (indices < cached_timesteps.numel()) & (cached_timesteps.index_select(0, safe_indices) == requested)
-        torch._assert_async(matches.all(), "AdaLN cache is missing a requested timestep.")
+        if device.type == "cuda":
+            matches = (indices < cached_timesteps.numel()) & (
+                cached_timesteps.index_select(0, safe_indices) == requested
+            )
+            torch._assert_async(matches.all(), "AdaLN cache is missing a requested timestep.")
         return safe_indices
 
     def resolve(

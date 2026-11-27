@@ -383,3 +383,65 @@ def test_minimax_h3_npu_parallel_topologies_fit_1_to_8_cards(monkeypatch) -> Non
         (2, 2, 4, 1),
         (4, 2, 8, 1),
     ]
+
+
+def test_raise_nofile_limit_clamps_to_hard_limit(monkeypatch) -> None:
+    import resource
+
+    from telefuser.worker.parallel_worker import _raise_nofile_limit
+
+    calls: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(resource, "getrlimit", lambda _res: (1024, 32768))
+    monkeypatch.setattr(resource, "setrlimit", lambda res, limits: calls.append((res, limits)))
+
+    _raise_nofile_limit(65536)
+    assert calls == [(resource.RLIMIT_NOFILE, (32768, 32768))]
+
+
+def test_minimax_h3_adaln_cache_indices_for_skips_assert_async_on_npu(monkeypatch) -> None:
+    from telefuser.models.minimax_h3_dit import MiniMaxH3AdaLNCache, MiniMaxH3DiT, MiniMaxH3DiTConfig
+
+    cfg = MiniMaxH3DiTConfig(
+        hidden_size=32,
+        num_layers=1,
+        token_refiner_num_layers=1,
+        num_attention_heads=4,
+        attention_head_dim=8,
+        ffn_hidden_size=64,
+        latents_dim=2,
+        audio_latents_dim=2,
+        patch_size=(1, 2, 2),
+        text_dim=16,
+        timestep_input_dim=8,
+        time_embed_hidden_size=32,
+        time_embed_dim=16,
+        rope_inv_freq_len=1,
+    )
+    model = MiniMaxH3DiT(cfg).eval()
+    model.enable_online_adaln_cache(partition="FL2VA")
+    assert model.materialize_online_adaln_cache_for_timesteps([0.25, 0.75, 1.0], device=torch.device("cpu")) is True
+    assert isinstance(model._adaln_cache, MiniMaxH3AdaLNCache)
+
+    assert_calls = 0
+
+    def fail_assert_async(*_args, **_kwargs):
+        nonlocal assert_calls
+        assert_calls += 1
+
+    class _NpuReqTensor(torch.Tensor):
+        def detach(self):  # type: ignore[override]
+            return super().detach().as_subclass(_NpuReqTensor)
+
+        def to(self, *args, **kwargs):  # type: ignore[override]
+            kwargs.pop("device", None)
+            return super().to(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "_assert_async", fail_assert_async)
+    idx = model._adaln_cache._indices_for(
+        torch.tensor([0.25, 1.0]).as_subclass(_NpuReqTensor),
+        SimpleNamespace(type="npu"),  # type: ignore[arg-type]
+        model._adaln_cache.timesteps,
+    )
+    assert idx.tolist() == [0, 2]
+    assert assert_calls == 0
+

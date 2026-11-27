@@ -442,10 +442,23 @@ def _run_telefuser_minimax_h3(args: argparse.Namespace, out_dir: Path) -> dict[s
     }
 
 
+def _raise_nofile_limit(target: int = 65536) -> None:
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired = target if hard == resource.RLIM_INFINITY else min(hard, target)
+        if soft < desired:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
 def _run_vllm_omni_minimax_h3(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     import imageio.v3 as iio
     from vllm_omni.entrypoints.async_omni import AsyncOmni
 
+    _raise_nofile_limit()
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     os.environ.setdefault("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", "4000")
     os.environ.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
@@ -455,9 +468,10 @@ def _run_vllm_omni_minimax_h3(args: argparse.Namespace, out_dir: Path) -> dict[s
     omni_kwargs: dict[str, Any] = {
         "model": args.omni_model_root,
         "trust_remote_code": True,
+        "task_type": "fl2va",
         "num_gpus": args.cards,
-        "usp": args.cards,
-        "ring": 1,
+        "ulysses_degree": args.cards,
+        "ring_degree": 1,
         "tensor_parallel_size": 1,
         "data_parallel_size": 1,
         "text_encoder_tp_size": args.cards,
@@ -466,7 +480,8 @@ def _run_vllm_omni_minimax_h3(args: argparse.Namespace, out_dir: Path) -> dict[s
         "vae_patch_parallel_size": args.cards,
         "enable_distributed_layerwise_offload": True,
         "dlo_use_allgather": args.cards > 1,
-        "diffusion_attention_backend": "FLASH_ATTN",
+        "enable_diffusion_pipeline_profiler": True,
+        "diffusion_attention_config": {"default": {"backend": "FLASH_ATTN"}},
         "stage_init_timeout": 1800.0,
         "init_timeout": 1800.0,
     }
@@ -518,7 +533,8 @@ def _run_vllm_omni_minimax_h3(args: argparse.Namespace, out_dir: Path) -> dict[s
                 digest = hashlib.sha256(rgb.tobytes()).hexdigest()
                 stage_durs = getattr(output, "stage_durations", None) or {}
                 denoise_val = float(
-                    stage_durs.get("denoise")
+                    stage_durs.get("diffuse")
+                    or stage_durs.get("denoise")
                     or stage_durs.get("denoising")
                     or stage_durs.get("dit")
                     or 0.0
@@ -635,6 +651,8 @@ def main() -> None:
     if not args.prompt:
         args.prompt = MINIMAX_H3_DEFAULT_PROMPT if args.model == "minimax_h3" else WAN22_DEFAULT_PROMPT
     if args.model == "minimax_h3":
+        if args.omni_model_root == "/models/Wan2.2-TI2V-5B-Diffusers":
+            args.omni_model_root = args.model_root
         if args.width == 864 and args.height == 480:
             args.width, args.height = 1344, 768
         if args.seed == 42:

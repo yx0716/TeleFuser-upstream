@@ -242,7 +242,7 @@ def load_minimax_h3_pipeline(
         offload_type=(
             WeightOffloadType.NO_CPU_OFFLOAD if use_resident_modules else WeightOffloadType.MODEL_CPU_OFFLOAD
         ),
-        pin_cpu_memory=False,
+        pin_cpu_memory=(not use_resident_modules and runtime_device.type == "npu"),
     )
     dit_offload = (
         OffloadConfig(offload_type=WeightOffloadType.NO_CPU_OFFLOAD, pin_cpu_memory=False)

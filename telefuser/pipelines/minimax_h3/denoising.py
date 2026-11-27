@@ -439,6 +439,7 @@ class MiniMaxH3DenoisingStage(BaseStage):
                 )
             )
 
+        all_schedule_timesteps: torch.Tensor | None = None
         materialize_online_adaln = getattr(self.transformer, "materialize_online_adaln_cache_for_timesteps", None)
         if (
             device.type == "npu"
@@ -449,6 +450,9 @@ class MiniMaxH3DenoisingStage(BaseStage):
             all_schedule_timesteps = torch.cat([step_items[0].detach().cpu() for step_items in timestep_plan])
             materialize_online_adaln(all_schedule_timesteps, device=device)
             current_platform.empty_cache()
+        elif device.type == "npu" and getattr(self.transformer, "_adaln_cache", None) is not None:
+            all_schedule_timesteps = torch.cat([step_items[0].detach().cpu() for step_items in timestep_plan])
+            self.transformer._adaln_cache._cpu_indices_for(all_schedule_timesteps)
 
         video_step_t = torch.tensor(
             [float(1.0 - sigma) for sigma in video_sigmas[:-1]],

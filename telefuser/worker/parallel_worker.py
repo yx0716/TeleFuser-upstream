@@ -38,6 +38,19 @@ if TYPE_CHECKING:
 _DISCARD_TENSOR_REFS = "__telefuser_discard_tensor_refs__"
 
 
+def _raise_nofile_limit(target: int = 65536) -> None:
+    """Raise soft RLIMIT_NOFILE toward target so multi-stage spawn does not exhaust 1024 container FDs."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired = target if hard == resource.RLIM_INFINITY else min(hard, target)
+        if soft < desired:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
 def _worker_platform(stage: BaseStage) -> BasePlatform:
     if stage.device_type == "cpu" and current_platform.device_type != "cpu":
         return CpuPlatform()
@@ -79,6 +92,7 @@ def _worker_loop(
     from telefuser.utils.profiler import mark_as_worker_process
 
     rank += rank_offset
+    _raise_nofile_limit()
     mark_as_worker_process()
     previous_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
     platform = _worker_platform(stage)
@@ -241,6 +255,7 @@ class ParallelWorker:
     ) -> None:
         parallel_config = stage.model_runtime_config.parallel_config
         parallel_config.validate()
+        _raise_nofile_limit()
 
         self._stage: BaseStage = stage  # Keep reference to wrapped stage for metrics proxying
         self.world_size: int = parallel_config.world_size
