@@ -31,6 +31,7 @@ from telefuser.distributed.ulysses_comm import (
     ulysses_gather_heads_chunk_async,
     ulysses_gather_heads_destination_major,
     ulysses_scatter_heads,
+    ulysses_scatter_qkv,
     ulysses_scatter_qkv_qknorm_rope_chunk_async,
 )
 from telefuser.feature_cache import AdaTaylorCacheCalibrator, NoOpCache
@@ -658,7 +659,8 @@ class MiniMaxH3Attention(nn.Module):
                 gather_wait()
             output = destination.flatten(2, 3)
         else:
-            if use_ulysses:
+            use_batched_qkv_scatter = use_ulysses and hidden.device.type == "npu"
+            if use_ulysses and not use_batched_qkv_scatter:
                 value_wait = ulysses_scatter_heads(
                     value.unsqueeze(0), group, tag="v", barrier=False, communicator=self.ulysses_communicator
                 )
@@ -677,7 +679,9 @@ class MiniMaxH3Attention(nn.Module):
             query = query.unsqueeze(0)
             key = key.unsqueeze(0)
             value = value.unsqueeze(0)
-            if use_ulysses:
+            if use_batched_qkv_scatter:
+                query, key, value = ulysses_scatter_qkv(query, key, value, group)()
+            elif use_ulysses:
                 query_wait = ulysses_scatter_heads(
                     query, group, tag="q", barrier=False, communicator=self.ulysses_communicator
                 )

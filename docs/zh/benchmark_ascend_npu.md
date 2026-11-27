@@ -24,9 +24,9 @@
 | 模型 / 任务 | 芯片规格与卡数 | 并行策略 | 架构 / CANN / 底座镜像 | 标准工作负载 | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `MiniMax-H3` (T2VA) | **1× Ascend 910B2 (64GB)** | Offload (Single-Card) | `x86_64` · CANN `9.3.0` (`vllm-omni:v0.34.0`) | 768p, 5s (24fps + 32kHz), 50 steps, BF16 | `PENDING` |
-| `MiniMax-H3` (T2VA) | **2× Ascend 910B2 (64GB)** | Resident Ulysses2 / TP2 | `x86_64` · CANN `9.3.0` (`vllm-omni:v0.34.0`) | 768p, 5s (24fps + 32kHz), 50 steps, BF16 | `PENDING` |
-| `MiniMax-H3` (T2VA) | **4× Ascend 910B2 (64GB)** | Resident Ulysses2 x TP2 | `x86_64` · CANN `9.3.0` (`vllm-omni:v0.34.0`) | 768p, 5s (24fps + 32kHz), 50 steps, BF16 | `PENDING` |
-| `MiniMax-H3` (T2VA) | **8× Ascend 910B2 (64GB)** | Resident Ulysses4 x TP2 | `x86_64` · CANN `9.3.0` (`vllm-omni:v0.34.0`) | 768p, 5s (24fps + 32kHz), 50 steps, BF16 | `PENDING` |
+| `MiniMax-H3` (T2VA) | **2× Ascend 910B2 (64GB)** | Resident TP2 | `x86_64` · CANN `9.3.0` (`vllm-omni:v0.34.0`) | 768p, 5s (24fps + 32kHz), 50 steps, BF16 | `PENDING` |
+| `MiniMax-H3` (T2VA) | **4× Ascend 910B2 (64GB)** | Resident Ulysses4 | `x86_64` · CANN `9.3.0` (`vllm-omni:v0.34.0`) | 768p, 5s (24fps + 32kHz), 50 steps, BF16 | `PENDING` |
+| `MiniMax-H3` (T2VA) | **8× Ascend 910B2 (64GB)** | Resident Ulysses8 | `x86_64` · CANN `9.3.0` (`vllm-omni:v0.34.0`) | 768p, 5s (24fps + 32kHz), 50 steps, BF16 | `PENDING` |
 
 ## 五阶可复现验收门禁
 

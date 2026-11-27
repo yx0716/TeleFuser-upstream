@@ -291,10 +291,11 @@ def test_mindie_attn_applies_exact_power_of_two_input_prescaling(monkeypatch) ->
 
     recorded: dict[str, object] = {}
 
-    def fake_forward(q, k, v, *, attn_mask=None, scale=None, head_first=False):
+    def fake_forward(q, k, v, *, attn_mask=None, scale=None, head_first=False, **kwargs):
         recorded["q_max"] = float(q.abs().max().item())
         recorded["scale"] = scale
         recorded["head_first"] = head_first
+        recorded["kwargs"] = kwargs
         return v.clone()
 
     monkeypatch.setattr(backends, "mindiesd_attention_forward", fake_forward)
@@ -306,7 +307,18 @@ def test_mindie_attn_applies_exact_power_of_two_input_prescaling(monkeypatch) ->
     assert recorded["q_max"] == 2.0
     assert recorded["scale"] == (128**-0.5) * (256.0 * 256.0)
     assert recorded["head_first"] is True
+    assert recorded["kwargs"] == {}
     assert torch.equal(out, v)
+
+    q_long = torch.full((1, 2, 4096, 128), 512.0, dtype=torch.bfloat16)
+    k_long = torch.full((1, 2, 4096, 128), 512.0, dtype=torch.bfloat16)
+    v_long = torch.full((1, 2, 4096, 128), 4.0, dtype=torch.bfloat16)
+    backends.mindie_attn(q_long, k_long, v_long, scale=128**-0.5, input_scale=256.0)
+    assert recorded["kwargs"] == {
+        "opt_mode": "manual",
+        "op_type": "ascend_laser_attention",
+        "layout": "BNSD",
+    }
 
 
 def test_minimax_h3_cpu_staged_online_adaln_materialization_matches_live() -> None:
@@ -380,8 +392,8 @@ def test_minimax_h3_npu_parallel_topologies_fit_1_to_8_cards(monkeypatch) -> Non
     assert recorded == [
         (1, 1, 1, 1),
         (1, 2, 2, 1),
-        (2, 2, 4, 1),
-        (4, 2, 8, 1),
+        (4, 1, 4, 1),
+        (8, 1, 8, 1),
     ]
 
 

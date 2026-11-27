@@ -244,6 +244,11 @@ def load_minimax_h3_pipeline(
         ),
         pin_cpu_memory=(not use_resident_modules and runtime_device.type == "npu"),
     )
+    text_offload = (
+        OffloadConfig(offload_type=WeightOffloadType.MODEL_CPU_OFFLOAD, pin_cpu_memory=True)
+        if runtime_device.type == "npu" and not resolved_enable_fsdp
+        else resident_offload
+    )
     dit_offload = (
         OffloadConfig(offload_type=WeightOffloadType.NO_CPU_OFFLOAD, pin_cpu_memory=False)
         if quant_config.enabled
@@ -267,7 +272,7 @@ def load_minimax_h3_pipeline(
         device_type=runtime_device.type,
         device_id=runtime_device.index or 0,
         torch_dtype=torch.bfloat16,
-        offload_config=resident_offload,
+        offload_config=text_offload,
         parallel_config=text_parallel,
     )
     attention_config = (

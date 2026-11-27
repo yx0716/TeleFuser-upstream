@@ -115,7 +115,8 @@ def get_pipeline(
 ) -> MiniMaxH3Pipeline:
     """Load the FL2VA checkpoint partition for 1, 2, 4, or 8 accelerators."""
     is_npu_target = str(device).partition(":")[0].strip().lower() == "npu"
-    tp_degree = (2 if parallelism in {2, 4, 8} else 1) if is_npu_target else (2 if parallelism in {4, 8} else 1)
+    tp_degree = (2 if parallelism == 2 else 1) if is_npu_target else (2 if parallelism in {4, 8} else 1)
+    resolved_enable_fsdp = False if (is_npu_target and enable_fsdp is None) else enable_fsdp
     resolved_attn_impl = (
         AttnImplType.MINDIE_ATTN
         if is_npu_target and attn_impl in (AttnImplType.FLASH_ATTN_4, "FLASH_ATTN_4")
@@ -129,7 +130,7 @@ def get_pipeline(
         ulysses_degree=parallelism // tp_degree,
         tp_degree=tp_degree,
         text_encoder_tp_degree=parallelism,
-        enable_fsdp=enable_fsdp,
+        enable_fsdp=resolved_enable_fsdp,
         online_adaln_cache=online_adaln_cache,
         attn_impl=resolved_attn_impl,
         attention_chunks=attention_chunks,
